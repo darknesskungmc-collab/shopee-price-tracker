@@ -33,9 +33,9 @@ jobs:
 
       - name: Run Shopee Tracker Script
         env:
-          DISCORD_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          DISCORD_INPUT_CHANNEL_ID: ${{ secrets.CHATBOT_SHOPEE }}
-          DISCORD_ALERT_CHANNEL_ID: ${{ secrets.UPDATE_PRICE }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHATBOT_SHOPEE: ${{ secrets.CHATBOT_SHOPEE }}
+          UPDATE_PRICE: ${{ secrets.UPDATE_PRICE }}
           SHOPEE_COOKIE: ${{ secrets.SHOPEE_COOKIE }}
         run: python main.py
 
