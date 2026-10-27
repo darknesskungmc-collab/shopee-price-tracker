@@ -1,61 +1,80 @@
-# Shopee Price Tracker for Discord
+# Shopee Price Tracker — Cloudflare Worker
 
-This project runs on GitHub Actions every 15 minutes. It reads recent Shopee
-links from one Discord channel, saves the products in `tracked_items.json`, and
-sends an alert to another channel only when a tracked price decreases.
+บอทนี้ตอบคำสั่ง Discord `/track <ลิงก์ Shopee>` ทันทีโดยไม่ต้องมีเครื่อง
+เปิดตลอดเวลา จากนั้น Cloudflare Cron จะเช็กราคาทุก 15 นาทีและแจ้งเตือนใน
+ห้อง `update-price` เมื่อราคาลดลง ข้อมูลรายการติดตามเก็บใน Cloudflare D1
+แทน GitHub Actions และ JSON file
 
-It is a scheduled REST integration, not a continuously connected Discord bot.
-The bot can show as offline between workflow runs and will not reply instantly.
+## ข้อจำกัดที่ควรรู้
 
-## Required GitHub Actions secrets
+- ฟรีได้สำหรับการใช้งานส่วนตัวจำนวนน้อยภายใน quota ของ Cloudflare Free
+  (100,000 Worker requests/วัน, Cron Trigger 5 รายการ, D1 มี daily limit)
+- การตอบ `/track` เป็นแบบทันที แต่การแจ้งราคาลดจะเร็วสุดตามรอบ 15 นาที
+- Shopee อาจเปลี่ยน endpoint, rate limit หรือบล็อก IP ของ Cloudflare ได้
+  เป็นครั้งคราว; เมื่อดึงราคาไม่ได้ Worker จะเก็บราคาเดิมไว้และลองใหม่รอบหน้า
+- Worker ตรวจได้สูงสุด 40 รายการต่อรอบ เพื่ออยู่ในขีดจำกัด Free plan
+- โค้ดเดิมใน `main.py` และ workflow เก่าถูกเก็บเป็น fallback เท่านั้น; schedule
+  ของ GitHub Actions ถูกปิดแล้ว ห้ามรันสองระบบพร้อมกัน
 
-Create these exact repository secrets under **Settings → Secrets and variables
-→ Actions**. Do not commit their values to the repository.
+## ตั้งค่าแบบฟรี
 
-| Secret | Value |
-| --- | --- |
-| `BOT_TOKEN` | Discord application **Bot Token** |
-| `CHATBOT_SHOPEE` | Numeric ID of the input channel where users post links |
-| `UPDATE_PRICE` | Numeric ID of the channel that receives price alerts |
-| `SHOPEE_COOKIE` | Optional Shopee browser cookie; may help if Shopee rate-limits requests |
+ต้องมีบัญชี Cloudflare ฟรี และติดตั้ง Node.js ที่มาพร้อม `npm` ไว้ใช้เฉพาะตอน
+deploy (ไม่ต้องเปิดเครื่องหลัง deploy)
 
-Enable Discord Developer Mode, right-click each channel, and select **Copy
-Channel ID**. A channel ID is a 17–20 digit number, not a channel name or URL.
+1. ติดตั้ง dependencies และ login:
 
-## Discord setup
+   ```powershell
+   npm install
+   npx wrangler login
+   npx wrangler d1 create shopee-tracker
+   ```
 
-Invite the Discord application as a bot to the target server. In the channel
-permissions for the bot role, enable:
+2. นำ `database_id` ที่คำสั่งคืนมาใส่ใน `wrangler.toml` และเติมค่า ID ทั้งหมด:
+   `APPLICATION_ID`, `DISCORD_GUILD_ID`, `INPUT_CHANNEL_ID`, `UPDATE_CHANNEL_ID`
+   และแนะนำให้ใส่ `OWNER_USER_ID` เพื่อจำกัดให้ใช้ได้คนเดียว
 
-| Channel | Required permissions |
-| --- | --- |
-| Input channel | View Channel, Read Message History, Send Messages, Add Reactions |
-| Alert channel | View Channel, Send Messages, Embed Links |
+3. ตั้งค่า secrets โดยคำสั่งต่อไปนี้จะถามค่าโดยไม่บันทึกลง Git:
 
-After changing a secret or permission, run **Actions → Shopee Price Tracker →
-Run workflow**, then read the log in **Run Shopee Tracker Script**. The script
-now fails the workflow with the Discord HTTP status if its token, channel ID,
-or permissions are invalid.
+   ```powershell
+   npx wrangler secret put DISCORD_BOT_TOKEN
+   npx wrangler secret put DISCORD_PUBLIC_KEY
+   npx wrangler secret put SHOPEE_COOKIE
+   ```
 
-## Using the bot
+   `SHOPEE_COOKIE` ไม่บังคับ แต่ช่วยได้เมื่อ Shopee ปฏิเสธคำขอ
 
-Post one supported Shopee URL in the input channel. The bot reacts with ✅ and
-posts a confirmation after it stores the item. To remove an item, post the same
-URL prefixed with `ลบ` or `delete`.
+4. สร้างตารางและ deploy:
 
-Supported links include `s.shopee.co.th`, `shp.ee`, `shopee.co.th`, and
-`www.shopee.co.th`. The workflow checks the 20 most recent input messages on
-each run.
+   ```powershell
+   npm run db:init
+   npm run deploy
+   ```
 
-## Local verification
+5. คัดลอก URL ที่ deploy ได้ (เช่น `https://shopee-price-tracker.<subdomain>.workers.dev`)
+   ไปใส่ใน Discord Developer Portal → **General Information** → **Interactions
+   Endpoint URL**. Discord จะส่ง PING เพื่อตรวจสอบโดยอัตโนมัติ
 
-```powershell
-./updateprice_bot/Scripts/python.exe -m pip install -r requirements.txt
-$env:BOT_TOKEN = "..."
-$env:CHATBOT_SHOPEE = "..."
-$env:UPDATE_PRICE = "..."
-./updateprice_bot/Scripts/python.exe main.py
+6. เพิ่ม scope `applications.commands` ให้บอทใน OAuth2 URL Generator แล้วเชิญบอท
+   เข้า server อีกครั้งถ้ายังไม่มี scope นี้ จากนั้นลงทะเบียนคำสั่งเฉพาะ server:
+
+   ```powershell
+   $env:DISCORD_BOT_TOKEN = Read-Host "Discord bot token"
+   $env:APPLICATION_ID = "ใส่ Application ID"
+   $env:DISCORD_GUILD_ID = "ใส่ Server ID"
+   npm run register-command
+   Remove-Item Env:DISCORD_BOT_TOKEN
+   ```
+
+เมื่อคำสั่งปรากฏใน Discord ให้ใช้ในห้องรับลิงก์:
+
+```text
+/track url:https://shopee.co.th/...
 ```
 
-Use a test Discord server or channels when testing. Never paste the bot token
-into Actions logs, chat messages, or committed files.
+บอทจะตอบ `กำลังเริ่มติดตาม…` ทันที และส่งผลการเริ่มติดตามไปที่ห้อง update-price
+
+## สิทธิ์ Discord
+
+บอทต้องมี View Channel, Send Messages และ Embed Links ในห้อง update-price และ
+View Channel กับ Send Messages ในห้องรับลิงก์. รูปแบบ Slash Command ไม่ต้องเปิด
+Message Content Intent เพราะไม่ได้อ่านข้อความธรรมดาแล้ว.

@@ -1,0 +1,21 @@
+name = "shopee-price-tracker"
+main = "src/worker.js"
+compatibility_date = "2026-10-27"
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "shopee-tracker"
+# Replace this with the ID returned by: npx wrangler d1 create shopee-tracker
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+# These are IDs, not secrets. Replace each value before deployment.
+APPLICATION_ID = "REPLACE_WITH_DISCORD_APPLICATION_ID"
+DISCORD_GUILD_ID = "REPLACE_WITH_DISCORD_SERVER_ID"
+INPUT_CHANNEL_ID = "REPLACE_WITH_INPUT_CHANNEL_ID"
+UPDATE_CHANNEL_ID = "REPLACE_WITH_UPDATE_CHANNEL_ID"
+# Optional but recommended: copy your numeric Discord user ID to restrict /track.
+OWNER_USER_ID = ""

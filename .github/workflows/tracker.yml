@@ -1,13 +1,8 @@
-name: Shopee Price Tracker
+name: Legacy GitHub Actions Tracker (disabled)
 
-on:
-  push:
-    branches: [ "main" ]
-
-  schedule:
-    - cron: '*/15 * * * *'
-
-  workflow_dispatch:
+# Cloudflare Worker is now the active implementation. Retained only as a
+# manually runnable fallback while the Worker is being deployed.
+on: workflow_dispatch
 
 # Prevent two runs from writing tracked_items.json at the same time.
 concurrency:
