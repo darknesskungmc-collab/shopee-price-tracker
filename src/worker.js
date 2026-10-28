@@ -1,8 +1,14 @@
 const DISCORD_API = "https://discord.com/api/v10";
+const DEFAULT_AFFILIATE_ENDPOINT = "https://open-api.affiliate.shopee.co.th/graphql";
 const INTERACTION_PING = 1;
 const APPLICATION_COMMAND = 2;
 const CHANNEL_MESSAGE_WITH_SOURCE = 4;
-const MAX_TRACKED_ITEMS_PER_RUN = 40;
+const DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = 5;
+// Free plan allows 50 fetch() subrequests per invocation. Each item costs one
+// Affiliate API call plus at most one Discord alert, so 20 stays well inside.
+const MAX_TRACKED_ITEMS_PER_RUN = 20;
+const MAX_REDIRECTS = 5;
+const DISCORD_MESSAGE_LIMIT = 2000;
 
 export default {
   async fetch(request, env, ctx) {
@@ -21,26 +27,36 @@ export default {
     if (interaction.type === INTERACTION_PING) {
       return discordResponse(INTERACTION_PING);
     }
-    if (interaction.type !== APPLICATION_COMMAND || interaction.data?.name !== "track") {
+    if (interaction.type !== APPLICATION_COMMAND) {
       return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, "ยังไม่รองรับคำสั่งนี้ครับ", true);
     }
 
-    if (env.OWNER_USER_ID && interaction.member?.user?.id !== env.OWNER_USER_ID) {
+    const userId = interaction.member?.user?.id ?? interaction.user?.id;
+    if (env.OWNER_USER_ID && userId !== env.OWNER_USER_ID) {
       return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, "คำสั่งนี้อนุญาตให้เจ้าของบอทใช้เท่านั้น", true);
     }
     if (interaction.channel_id !== env.INPUT_CHANNEL_ID) {
       return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, "กรุณาใช้คำสั่งนี้ในห้องรับลิงก์ที่กำหนด", true);
     }
 
-    const productUrl = interaction.data.options?.find((option) => option.name === "url")?.value?.trim();
-    if (!isShopeeUrl(productUrl)) {
+    const command = interaction.data?.name;
+    if (command === "list") {
+      return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, await listTrackedItems(env));
+    }
+    if (command !== "track" && command !== "untrack") {
+      return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, "ยังไม่รองรับคำสั่งนี้ครับ", true);
+    }
+
+    const input = interaction.data.options?.find((option) => option.name === "url")?.value?.trim();
+    if (!parseItemKey(input) && !isShopeeUrl(input)) {
       return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, "กรุณาส่งลิงก์สินค้า Shopee ที่ถูกต้อง", true);
     }
 
-    // Discord requires this first response within three seconds. Product lookup
-    // happens after the acknowledgement and reports its result in update-price.
-    ctx.waitUntil(startTracking(env, productUrl));
-    return discordResponse(CHANNEL_MESSAGE_WITH_SOURCE, "⏳ รับลิงก์แล้ว กำลังเริ่มติดตามสินค้า…");
+    // Discord requires the first response within three seconds, so the
+    // lookup runs after a deferred acknowledgement and edits that reply.
+    const task = command === "track" ? startTracking(env, input) : stopTracking(env, input);
+    ctx.waitUntil(task.then((payload) => editOriginalResponse(interaction, payload)));
+    return discordResponse(DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE);
   },
 
   async scheduled(_event, env, ctx) {
@@ -66,7 +82,7 @@ async function verifyDiscordRequest(env, signature, timestamp, body) {
       false,
       ["verify"],
     );
-    return crypto.subtle.verify(
+    return await crypto.subtle.verify(
       { name: "Ed25519" },
       key,
       hexToBytes(signature),
@@ -87,16 +103,19 @@ function hexToBytes(value) {
 
 function isShopeeUrl(value) {
   try {
-    const host = new URL(value).hostname.toLowerCase();
-    return host === "shp.ee" || host === "shopee.co.th" || host.endsWith(".shopee.co.th");
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === "https:" &&
+      (host === "shp.ee" || host === "shopee.co.th" || host.endsWith(".shopee.co.th"));
   } catch {
     return false;
   }
 }
 
-async function startTracking(env, sharedUrl) {
+async function startTracking(env, input) {
   try {
-    const item = await resolveAndFetchItem(sharedUrl, env);
+    const ids = await resolveIds(input);
+    const item = await fetchAffiliateItem(ids.shopId, ids.itemId, env);
     const now = new Date().toISOString();
     const existing = await env.DB.prepare(
       "SELECT item_key FROM tracked_items WHERE item_key = ?",
@@ -119,16 +138,54 @@ async function startTracking(env, sharedUrl) {
     ).run();
 
     const status = existing ? "ติดตามรายการนี้อยู่แล้ว" : "เริ่มติดตามสินค้าแล้ว";
-    await sendChannelMessage(env, env.UPDATE_CHANNEL_ID, {
+    return {
       content: `✅ **${status}**`,
-      embeds: [productEmbed(item, `ราคาเริ่มต้น: **฿${formatPrice(item.price)}**`)],
-    });
+      embeds: [productEmbed(item, `ราคาปัจจุบัน: **฿${formatPrice(item.price)}**`)],
+    };
   } catch (error) {
     console.error("Could not start tracking", error);
-    await sendChannelMessage(env, env.UPDATE_CHANNEL_ID, {
-      content: `❌ เริ่มติดตามสินค้าไม่สำเร็จ: ${safeError(error)}`,
-    });
+    return { content: `❌ เริ่มติดตามสินค้าไม่สำเร็จ: ${safeError(error)}` };
   }
+}
+
+async function stopTracking(env, input) {
+  try {
+    const ids = await resolveIds(input);
+    const key = `${ids.shopId}_${ids.itemId}`;
+    const row = await env.DB.prepare(
+      "DELETE FROM tracked_items WHERE item_key = ? RETURNING title",
+    ).bind(key).first();
+    return {
+      content: row
+        ? `🗑️ เลิกติดตาม **${row.title.slice(0, 200)}** แล้วครับ`
+        : "ℹ️ ไม่พบสินค้านี้ในรายการติดตามครับ",
+    };
+  } catch (error) {
+    console.error("Could not stop tracking", error);
+    return { content: `❌ เลิกติดตามไม่สำเร็จ: ${safeError(error)}` };
+  }
+}
+
+async function listTrackedItems(env) {
+  const { results: items } = await env.DB.prepare(
+    "SELECT item_key, title, initial_price, current_price FROM tracked_items ORDER BY created_at ASC",
+  ).all();
+  if (!items?.length) return "ℹ️ ยังไม่มีสินค้าที่ติดตามอยู่ครับ";
+
+  const lines = [`📋 **สินค้าที่ติดตาม (${items.length} รายการ)**`];
+  for (const [index, item] of items.entries()) {
+    const line = `${index + 1}. ${item.title.slice(0, 60)} — ฿${formatPrice(item.current_price)}` +
+      ` (เริ่ม ฿${formatPrice(item.initial_price)}) \`${item.item_key}\``;
+    if (lines.join("\n").length + line.length + 30 > DISCORD_MESSAGE_LIMIT) {
+      lines.push(`…และอีก ${items.length - index} รายการ`);
+      break;
+    }
+    lines.push(line);
+  }
+  if (items.length > MAX_TRACKED_ITEMS_PER_RUN) {
+    lines.push(`⚠️ เกิน ${MAX_TRACKED_ITEMS_PER_RUN} รายการ แต่ละชิ้นจะถูกเช็กห่างกว่า 15 นาที`);
+  }
+  return lines.join("\n");
 }
 
 async function checkTrackedPrices(env) {
@@ -137,17 +194,15 @@ async function checkTrackedPrices(env) {
   ).bind(MAX_TRACKED_ITEMS_PER_RUN).all();
 
   for (const item of items ?? []) {
+    const now = new Date().toISOString();
     try {
-      const latest = await fetchShopeeItem(item.shop_id, item.item_id, env);
+      const latest = await fetchAffiliateItem(item.shop_id, item.item_id, env);
       const previousPrice = Number(item.current_price);
 
       if (latest.price < previousPrice) {
         await sendChannelMessage(env, env.UPDATE_CHANNEL_ID, {
           content: "🚨 **แจ้งเตือนสินค้าลดราคา!**",
-          embeds: [productEmbed(
-            latest,
-            `ราคาเดิม: ~~฿${formatPrice(previousPrice)}~~\n🔥 ราคาใหม่: **฿${formatPrice(latest.price)}**\n📉 ลดลง: **฿${formatPrice(previousPrice - latest.price)}**`,
-          )],
+          embeds: [productEmbed(latest, priceDropDescription(item, previousPrice, latest.price))],
         });
       }
 
@@ -158,77 +213,128 @@ async function checkTrackedPrices(env) {
         WHERE item_key = ?
       `).bind(
         latest.title, latest.variant, latest.url, latest.imageUrl, latest.price,
-        new Date().toISOString(), item.item_key,
+        now, item.item_key,
       ).run();
     } catch (error) {
-      // Preserve the last known price. One unavailable Shopee product must not
-      // stop the remaining products from being checked.
+      // Preserve the last known price, but move the item to the back of the
+      // queue so repeatedly failing items cannot starve the others.
       console.warn(`Price check failed for ${item.item_key}: ${safeError(error)}`);
+      await env.DB.prepare("UPDATE tracked_items SET updated_at = ? WHERE item_key = ?")
+        .bind(now, item.item_key).run();
     }
   }
 }
 
-async function resolveAndFetchItem(sharedUrl, env) {
-  const response = await fetch(sharedUrl, {
-    redirect: "follow",
-    headers: shopeeHeaders(env),
-  });
-  const ids = extractIds(response.url);
-  if (!ids) throw new Error("ไม่พบ shop_id และ item_id ในลิงก์ Shopee");
-  return fetchShopeeItem(ids.shopId, ids.itemId, env);
+function priceDropDescription(item, previousPrice, newPrice) {
+  const drop = previousPrice - newPrice;
+  const percent = Math.round((drop / previousPrice) * 100);
+  const lines = [
+    `ราคาเดิม: ~~฿${formatPrice(previousPrice)}~~`,
+    `🔥 ราคาใหม่: **฿${formatPrice(newPrice)}**`,
+    `📉 ลดลง: **฿${formatPrice(drop)} (${percent}%)**`,
+  ];
+  const initialPrice = Number(item.initial_price);
+  if (initialPrice > newPrice) {
+    lines.push(`*(ถูกกว่าตอนเริ่มติดตาม ฿${formatPrice(initialPrice - newPrice)})*`);
+  }
+  return lines.join("\n");
 }
 
-function extractIds(url) {
-  const productMatch = url.match(/\/product\/(\d+)\/(\d+)/i);
-  const itemMatch = url.match(/i\.(\d+)\.(\d+)/i);
-  const match = productMatch ?? itemMatch;
+function parseItemKey(value) {
+  const match = value?.match(/^(\d+)[_.](\d+)$/);
   return match ? { shopId: match[1], itemId: match[2] } : null;
 }
 
-async function fetchShopeeItem(shopId, itemId, env) {
-  const endpoint = new URL("https://shopee.co.th/api/v4/item/get");
-  endpoint.searchParams.set("shopid", shopId);
-  endpoint.searchParams.set("itemid", itemId);
+function extractIds(url) {
+  let decoded = url;
+  try {
+    decoded = decodeURIComponent(url);
+  } catch {
+    // Keep the raw URL when it contains a malformed escape sequence.
+  }
+  const match = decoded.match(/\/product\/(\d+)\/(\d+)/i) ?? decoded.match(/i\.(\d+)\.(\d+)/i);
+  return match ? { shopId: match[1], itemId: match[2] } : null;
+}
 
-  const response = await fetch(endpoint, { headers: shopeeHeaders(env) });
-  if (!response.ok) throw new Error(`Shopee HTTP ${response.status}`);
-  const payload = await response.json();
-  const data = payload?.data;
-  const rawPrice = data?.price_min ?? data?.price;
-  if (!data?.name || !Number.isFinite(Number(rawPrice)) || Number(rawPrice) <= 0) {
-    throw new Error("Shopee ไม่ส่งข้อมูลราคาสินค้าที่ใช้งานได้");
+// Short links (shp.ee, s.shopee.co.th) are resolved by reading redirect
+// Location headers only; the product page itself is never requested.
+async function resolveIds(input) {
+  const direct = parseItemKey(input) ?? extractIds(input);
+  if (direct) return direct;
+
+  let url = input;
+  for (let hop = 0; hop < MAX_REDIRECTS && isShopeeUrl(url); hop++) {
+    const response = await fetch(url, { redirect: "manual" });
+    const location = response.headers.get("location");
+    if (!location) break;
+    url = new URL(location, url).toString();
+    const ids = extractIds(url);
+    if (ids) return ids;
+  }
+  throw new Error("ไม่พบ shop_id และ item_id ในลิงก์ Shopee (ลองใช้ลิงก์เต็มจากหน้าสินค้า)");
+}
+
+async function fetchAffiliateItem(shopId, itemId, env) {
+  if (!env.SHOPEE_AFFILIATE_APP_ID || !env.SHOPEE_AFFILIATE_SECRET) {
+    throw new Error("ยังไม่ได้ตั้งค่า SHOPEE_AFFILIATE_APP_ID / SHOPEE_AFFILIATE_SECRET");
+  }
+  if (!/^\d+$/.test(shopId) || !/^\d+$/.test(itemId)) {
+    throw new Error("shop_id หรือ item_id ไม่ถูกต้อง");
   }
 
-  const models = Array.isArray(data.models) ? data.models : [];
-  const cheapest = models.reduce(
-    (lowest, model) => Number(model.price) < Number(lowest.price) ? model : lowest,
-    { price: rawPrice, name: "มาตรฐาน" },
+  // The signature covers the exact body bytes, so serialise once and reuse.
+  const payload = JSON.stringify({
+    query: `{ productOfferV2(shopId: ${shopId}, itemId: ${itemId}, limit: 1) {
+      nodes { itemId shopId productName priceMin priceMax imageUrl productLink }
+    } }`,
+  });
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const signature = await sha256Hex(
+    env.SHOPEE_AFFILIATE_APP_ID + timestamp + payload + env.SHOPEE_AFFILIATE_SECRET,
   );
-  const imageUrl = data.image
-    ? `https://down-th.img.susercontent.com/file/${data.image}`
-    : null;
+
+  const response = await fetch(env.SHOPEE_AFFILIATE_ENDPOINT || DEFAULT_AFFILIATE_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `SHA256 Credential=${env.SHOPEE_AFFILIATE_APP_ID}, Timestamp=${timestamp}, Signature=${signature}`,
+    },
+    body: payload,
+  });
+  if (!response.ok) throw new Error(`Shopee Affiliate HTTP ${response.status}`);
+
+  const result = await response.json();
+  if (result.errors?.length) {
+    throw new Error(`Shopee Affiliate: ${result.errors[0].message}`);
+  }
+  const node = result.data?.productOfferV2?.nodes?.[0];
+  if (!node || String(node.itemId) !== itemId) {
+    throw new Error("ไม่พบสินค้านี้ใน Shopee Affiliate (สินค้าอาจไม่ได้เข้าร่วมโปรแกรม)");
+  }
+
+  const priceMin = Number(node.priceMin);
+  const priceMax = Number(node.priceMax);
+  if (!Number.isFinite(priceMin) || priceMin <= 0) {
+    throw new Error("Shopee Affiliate ไม่ส่งราคาสินค้าที่ใช้งานได้");
+  }
 
   return {
     key: `${shopId}_${itemId}`,
     shopId,
     itemId,
-    title: String(data.name),
-    variant: cheapest.name || "มาตรฐาน",
-    price: Number(rawPrice) / 100000,
-    imageUrl,
-    url: `https://shopee.co.th/product/${shopId}/${itemId}`,
+    title: String(node.productName),
+    variant: priceMax > priceMin
+      ? `฿${formatPrice(priceMin)} – ฿${formatPrice(priceMax)} (แจ้งตามราคาต่ำสุด)`
+      : "ราคาเดียว",
+    price: priceMin,
+    imageUrl: node.imageUrl || null,
+    url: node.productLink || `https://shopee.co.th/product/${shopId}/${itemId}`,
   };
 }
 
-function shopeeHeaders(env) {
-  const headers = {
-    Accept: "application/json, text/plain, */*",
-    "Accept-Language": "th-TH,th;q=0.9,en;q=0.8",
-    Referer: "https://shopee.co.th/",
-    "User-Agent": "Mozilla/5.0 (compatible; ShopeePriceTracker/1.0)",
-  };
-  if (env.SHOPEE_COOKIE) headers.Cookie = env.SHOPEE_COOKIE;
-  return headers;
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function productEmbed(item, description) {
@@ -236,11 +342,24 @@ function productEmbed(item, description) {
     title: item.title.slice(0, 256),
     url: item.url,
     color: 0xee4d2d,
-    description: `ตัวเลือก: ${item.variant}\n\n${description}`,
+    description: `ช่วงราคา: ${item.variant}\n\n${description}`,
     footer: { text: "Shopee Price Tracker" },
   };
   if (item.imageUrl) embed.thumbnail = { url: item.imageUrl };
   return embed;
+}
+
+async function editOriginalResponse(interaction, payload) {
+  // Interaction webhooks are authorised by the token in the URL, not the bot token.
+  const response = await fetch(
+    `${DISCORD_API}/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) console.error(`Discord HTTP ${response.status}: ${await response.text()}`);
 }
 
 async function sendChannelMessage(env, channelId, payload) {
@@ -256,7 +375,7 @@ async function sendChannelMessage(env, channelId, payload) {
 }
 
 function formatPrice(value) {
-  return new Intl.NumberFormat("th-TH", { maximumFractionDigits: 0 }).format(value);
+  return new Intl.NumberFormat("th-TH", { maximumFractionDigits: 2 }).format(value);
 }
 
 function safeError(error) {

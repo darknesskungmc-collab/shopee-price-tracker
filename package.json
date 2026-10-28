@@ -7,7 +7,11 @@
     "dev": "wrangler dev",
     "db:init": "wrangler d1 execute shopee-tracker --remote --file=./schema.sql",
     "register-command": "node scripts/register-command.mjs",
-    "check": "node --check src/worker.js && node --check scripts/register-command.mjs"
+    "check": "node --check src/worker.js && node --check scripts/register-command.mjs",
+    "test": "node --no-warnings test/worker.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

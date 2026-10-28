@@ -10,6 +10,5 @@
 .wrangler/
 node_modules/
 
-# Legacy local Python environment (not part of the Worker deployment)
-updateprice_bot/
-__pycache__/
+# Claude Code per-machine settings
+.claude/settings.local.json

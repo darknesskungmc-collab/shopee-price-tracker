@@ -1,27 +1,39 @@
 # Shopee Price Tracker — Cloudflare Worker
 
-บอทนี้ตอบคำสั่ง Discord `/track <ลิงก์ Shopee>` ทันทีโดยไม่ต้องมีเครื่อง
-เปิดตลอดเวลา จากนั้น Cloudflare Cron จะเช็กราคาทุก 15 นาทีและแจ้งเตือนใน
-ห้อง `update-price` เมื่อราคาลดลง ข้อมูลรายการติดตามเก็บใน Cloudflare D1
-แทน GitHub Actions และ JSON file
+> **สถานะ (2026-10-29): พักโปรเจ็กไว้** โค้ดเสร็จและผ่านการทดสอบในเครื่อง (`npm test`)
+> แต่ยังไม่ได้ deploy เพราะยังไม่ได้สิทธิ์ใช้ Shopee Affiliate Open API ดูรายละเอียดใน
+> [CLAUDE.md](CLAUDE.md)
+
+บอท Discord สำหรับติดตามราคาสินค้า Shopee ใช้งานคนเดียว ฟรี และไม่ต้องเปิดเครื่อง
+ทิ้งไว้ ราคาดึงจาก **Shopee Affiliate Open API** (API ทางการ) Cloudflare Cron
+จะเช็กราคาทุก 15 นาที และแจ้งเตือนในห้อง update-price เมื่อราคาลดลง ข้อมูล
+เก็บใน Cloudflare D1
+
+## คำสั่ง (ใช้ในห้องรับลิงก์)
+
+| คำสั่ง | ทำอะไร |
+| --- | --- |
+| `/track url:<ลิงก์ Shopee>` | เริ่มติดตามราคา |
+| `/untrack url:<ลิงก์ หรือรหัสจาก /list>` | เลิกติดตาม |
+| `/list` | ดูรายการที่ติดตามอยู่ |
 
 ## ข้อจำกัดที่ควรรู้
 
-- ฟรีได้สำหรับการใช้งานส่วนตัวจำนวนน้อยภายใน quota ของ Cloudflare Free
-  (100,000 Worker requests/วัน, Cron Trigger 5 รายการ, D1 มี daily limit)
-- การตอบ `/track` เป็นแบบทันที แต่การแจ้งราคาลดจะเร็วสุดตามรอบ 15 นาที
-- Shopee อาจเปลี่ยน endpoint, rate limit หรือบล็อก IP ของ Cloudflare ได้
-  เป็นครั้งคราว; เมื่อดึงราคาไม่ได้ Worker จะเก็บราคาเดิมไว้และลองใหม่รอบหน้า
-- Worker ตรวจได้สูงสุด 40 รายการต่อรอบ เพื่ออยู่ในขีดจำกัด Free plan
-- โค้ดเดิมใน `main.py` และ workflow เก่าถูกเก็บเป็น fallback เท่านั้น; schedule
-  ของ GitHub Actions ถูกปิดแล้ว ห้ามรันสองระบบพร้อมกัน
+- ต้องมีบัญชี Shopee Affiliate (TH) ที่ได้รับอนุมัติแล้ว และติดตามได้เฉพาะสินค้าที่
+  เข้าร่วมโปรแกรม Affiliate เท่านั้น สินค้าที่ไม่ได้เข้าร่วมจะขึ้นว่า "ไม่พบสินค้านี้"
+- Affiliate API ให้แค่ราคาต่ำสุดและสูงสุด แยกราคาตามตัวเลือกสินค้าไม่ได้ บอทจึง
+  แจ้งเตือนตามราคาต่ำสุด และราคาใน API อาจอัปเดตช้ากว่าหน้าเว็บ
+- แจ้งราคาลดได้เร็วสุดทุก 15 นาที แต่ละรอบเช็กได้สูงสุด 20 รายการ ถ้าติดตาม
+  เกิน 20 รายการ แต่ละชิ้นจะถูกเช็กห่างกว่า 15 นาที
+- อยู่ใน Cloudflare Free plan ได้สบายถ้าใช้งานคนเดียว
 
-## ตั้งค่าแบบฟรี
+## ตั้งค่า
 
-ต้องมีบัญชี Cloudflare ฟรี และติดตั้ง Node.js ที่มาพร้อม `npm` ไว้ใช้เฉพาะตอน
-deploy (ไม่ต้องเปิดเครื่องหลัง deploy)
+ต้องมีบัญชี Cloudflare ฟรี และติดตั้ง Node.js ไว้ใช้เฉพาะตอน deploy
 
-1. ติดตั้ง dependencies และ login:
+1. ขอ App ID และ Secret จาก Shopee Affiliate (affiliate.shopee.co.th → Open API)
+
+2. ติดตั้ง dependencies แล้ว login (ถ้ายังไม่มี D1 database ให้สร้างด้วยคำสั่งสุดท้าย):
 
    ```powershell
    npm install
@@ -29,33 +41,30 @@ deploy (ไม่ต้องเปิดเครื่องหลัง deplo
    npx wrangler d1 create shopee-tracker
    ```
 
-2. นำ `database_id` ที่คำสั่งคืนมาใส่ใน `wrangler.toml` และเติมค่า ID ทั้งหมด:
-   `APPLICATION_ID`, `DISCORD_GUILD_ID`, `INPUT_CHANNEL_ID`, `UPDATE_CHANNEL_ID`
-   และแนะนำให้ใส่ `OWNER_USER_ID` เพื่อจำกัดให้ใช้ได้คนเดียว
+3. ใน `wrangler.toml` ให้ใส่ `database_id`, `INPUT_CHANNEL_ID`, `UPDATE_CHANNEL_ID`
+   และ `OWNER_USER_ID` (แนะนำให้ใส่ เพื่อจำกัดให้ใช้ได้คนเดียว)
 
-3. ตั้งค่า secrets โดยคำสั่งต่อไปนี้จะถามค่าโดยไม่บันทึกลง Git:
+4. ตั้งค่า secrets คำสั่งจะให้พิมพ์ค่าในเทอร์มินัล และไม่บันทึกค่าลง Git:
 
    ```powershell
    npx wrangler secret put DISCORD_BOT_TOKEN
    npx wrangler secret put DISCORD_PUBLIC_KEY
-   npx wrangler secret put SHOPEE_COOKIE
+   npx wrangler secret put SHOPEE_AFFILIATE_APP_ID
+   npx wrangler secret put SHOPEE_AFFILIATE_SECRET
    ```
 
-   `SHOPEE_COOKIE` ไม่บังคับ แต่ช่วยได้เมื่อ Shopee ปฏิเสธคำขอ
-
-4. สร้างตารางและ deploy:
+5. สร้างตารางแล้ว deploy:
 
    ```powershell
    npm run db:init
    npm run deploy
    ```
 
-5. คัดลอก URL ที่ deploy ได้ (เช่น `https://shopee-price-tracker.<subdomain>.workers.dev`)
+6. คัดลอก URL ที่ deploy ได้ (เช่น `https://shopee-price-tracker.<subdomain>.workers.dev`)
    ไปใส่ใน Discord Developer Portal → **General Information** → **Interactions
-   Endpoint URL**. Discord จะส่ง PING เพื่อตรวจสอบโดยอัตโนมัติ
+   Endpoint URL** แล้วกด Save Discord จะส่งคำขอทดสอบมาตรวจ URL ให้เอง
 
-6. เพิ่ม scope `applications.commands` ให้บอทใน OAuth2 URL Generator แล้วเชิญบอท
-   เข้า server อีกครั้งถ้ายังไม่มี scope นี้ จากนั้นลงทะเบียนคำสั่งเฉพาะ server:
+7. ลงทะเบียนคำสั่งใน server (บอทต้องถูกเชิญเข้า server ด้วย scope `applications.commands`):
 
    ```powershell
    $env:DISCORD_BOT_TOKEN = Read-Host "Discord bot token"
@@ -65,16 +74,15 @@ deploy (ไม่ต้องเปิดเครื่องหลัง deplo
    Remove-Item Env:DISCORD_BOT_TOKEN
    ```
 
-เมื่อคำสั่งปรากฏใน Discord ให้ใช้ในห้องรับลิงก์:
+## Auto-deploy จาก GitHub (ไม่บังคับ)
 
-```text
-/track url:https://shopee.co.th/...
-```
-
-บอทจะตอบ `กำลังเริ่มติดตาม…` ทันที และส่งผลการเริ่มติดตามไปที่ห้อง update-price
+push โปรเจ็กนี้ขึ้น repo แบบ private แล้วไปที่ Cloudflare Dashboard → Workers →
+shopee-price-tracker → Settings → Builds → Connect เลือก repo นั้น หลังจากนี้ทุก
+ครั้งที่ push ขึ้น `main` ระบบจะ deploy ให้เอง ส่วน secrets ยังเก็บไว้ใน Cloudflare
+ไม่ต้องใส่ใน repo
 
 ## สิทธิ์ Discord
 
-บอทต้องมี View Channel, Send Messages และ Embed Links ในห้อง update-price และ
-View Channel กับ Send Messages ในห้องรับลิงก์. รูปแบบ Slash Command ไม่ต้องเปิด
-Message Content Intent เพราะไม่ได้อ่านข้อความธรรมดาแล้ว.
+ในห้อง update-price บอทต้องมีสิทธิ์ View Channel, Send Messages และ Embed Links
+ส่วนการตอบคำสั่งในห้องรับลิงก์ ใช้ interaction webhook จึงไม่ต้องให้สิทธิ์เพิ่ม และ
+ไม่ต้องเปิด Message Content Intent

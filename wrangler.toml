@@ -9,13 +9,13 @@ crons = ["*/15 * * * *"]
 binding = "DB"
 database_name = "shopee-tracker"
 # Replace this with the ID returned by: npx wrangler d1 create shopee-tracker
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "bf3e6e03-69df-420e-926e-f3907812b36a"
 
 [vars]
 # These are IDs, not secrets. Replace each value before deployment.
-APPLICATION_ID = "REPLACE_WITH_DISCORD_APPLICATION_ID"
-DISCORD_GUILD_ID = "REPLACE_WITH_DISCORD_SERVER_ID"
 INPUT_CHANNEL_ID = "REPLACE_WITH_INPUT_CHANNEL_ID"
 UPDATE_CHANNEL_ID = "REPLACE_WITH_UPDATE_CHANNEL_ID"
-# Optional but recommended: copy your numeric Discord user ID to restrict /track.
+# Optional but recommended: copy your numeric Discord user ID to restrict commands.
 OWNER_USER_ID = ""
+# Shopee Affiliate Open API for Thailand.
+SHOPEE_AFFILIATE_ENDPOINT = "https://open-api.affiliate.shopee.co.th/graphql"

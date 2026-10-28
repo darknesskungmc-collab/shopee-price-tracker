@@ -1,4 +1,5 @@
 # Development-only values. Never commit a real .dev.vars file.
 DISCORD_BOT_TOKEN=""
 DISCORD_PUBLIC_KEY=""
-SHOPEE_COOKIE=""
+SHOPEE_AFFILIATE_APP_ID=""
+SHOPEE_AFFILIATE_SECRET=""
